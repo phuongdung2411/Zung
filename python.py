@@ -29,9 +29,14 @@ API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 def format_currency(amount: float) -> str:
     """Định dạng tiền tệ sang tỷ VND"""
-    if abs(amount) >= 1e9:
+    if math.isnan(amount):
+        return "N/A"
+        
+    abs_amount = abs(amount)
+    
+    if abs_amount >= 1e9:
         return f"{amount / 1e9:,.2f} tỷ VND"
-    elif abs(amount) >= 1e6:
+    elif abs_amount >= 1e6:
         return f"{amount / 1e6:,.2f} triệu VND"
     return f"{amount:,.0f} VND"
 
@@ -49,25 +54,38 @@ def read_docx(uploaded_file: st.runtime.uploaded_file_manager.UploadedFile) -> s
         return ""
 
 def clean_and_convert_to_float(value: str) -> float:
-    """Làm sạch chuỗi (xóa đơn vị, ký tự không phải số/dấu phẩy/dấu chấm) và chuyển thành float."""
+    """Làm sạch chuỗi và chuyển thành float. Xử lý các đơn vị 'tỷ', 'triệu', '%'."""
     if not value:
         return 0.0
     
-    # Chuẩn hóa đơn vị
+    # Chuẩn hóa đơn vị và hệ số nhân
     multiplier = 1.0
     if 'tỷ' in value.lower() or 'ty' in value.lower() or 'b' in value.lower():
         multiplier = 1e9
     elif 'triệu' in value.lower() or 'tr' in value.lower() or 'm' in value.lower():
         multiplier = 1e6
-    
-    # Loại bỏ ký tự không phải số, dấu phẩy, dấu chấm, và ký tự đơn vị.
+        
+    is_percentage = '%' in value
+
+    # Loại bỏ các ký tự đơn vị và ký tự không cần thiết
     cleaned = value.lower().replace('%', '').replace('vnd', '').replace('tỷ', '').replace('ty', '').replace('tr', '').replace('m', '').replace('b', '').strip()
     
-    # Xử lý định dạng thập phân (dùng dấu phẩy hoặc dấu chấm)
-    cleaned = cleaned.replace('.', '').replace(',', '.') # Giữ lại dấu chấm cuối cùng làm thập phân
-
+    # Xử lý định dạng thập phân (xóa tất cả dấu chấm/phẩy trừ dấu cuối cùng làm thập phân)
+    if cleaned.count('.') > 1 and cleaned.count(',') == 0: # Ví dụ: 10.000.000
+        cleaned = cleaned.replace('.', '')
+    elif cleaned.count(',') > 1 and cleaned.count('.') == 0: # Ví dụ: 10,000,000
+        cleaned = cleaned.replace(',', '')
+    
+    cleaned = cleaned.replace(',', '.') # Chuẩn hóa dấu phẩy thành dấu chấm
+    
     try:
-        return float(cleaned) * multiplier
+        result = float(cleaned) * multiplier
+        
+        # Nếu là tỷ lệ (WACC, Thuế), chia cho 100 nếu nó được trích xuất dưới dạng số nguyên lớn (ví dụ: 20 thay vì 0.2)
+        if is_percentage and result > 1:
+            return result / 100.0
+            
+        return result
     except ValueError:
         return 0.0
 
@@ -78,9 +96,10 @@ def call_gemini_api(prompt: str, system_instruction: str, is_json: bool, schema:
     
     payload: Dict[str, Any] = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_instruction}]},
         "config": {
             "temperature": 0.1,
+            # Tăng cường khả năng trích xuất chính xác hơn
+            "systemInstruction": system_instruction 
         }
     }
 
@@ -98,7 +117,12 @@ def call_gemini_api(prompt: str, system_instruction: str, is_json: bool, schema:
             if result and result.get('candidates') and result['candidates'][0].get('content'):
                 text = result['candidates'][0]['content']['parts'][0]['text']
                 if is_json:
-                    return json.loads(text)
+                    # Rất quan trọng: Xử lý lỗi JSON Decode nếu AI trả về chuỗi text
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        st.error(f"Lỗi giải mã JSON. AI đã trả về văn bản không phải JSON: {text[:100]}...")
+                        return None
                 return text
             else:
                 st.error(f"Lỗi: AI trả về không có nội dung. Phản hồi: {result}")
@@ -111,12 +135,9 @@ def call_gemini_api(prompt: str, system_instruction: str, is_json: bool, schema:
             else:
                 st.error(f"Lỗi gọi API Gemini sau {MAX_RETRIES} lần thử: {e}")
                 return None
-        except json.JSONDecodeError:
-            if is_json:
-                 st.error("Lỗi giải mã JSON từ phản hồi AI.")
-                 # Thử trả về text thô nếu JSON decode lỗi
-                 return text 
-            return text 
+        except Exception as e:
+            st.error(f"Lỗi không xác định khi gọi API: {e}")
+            return None
     return None
 
 def extract_financial_data(doc_text: str) -> Dict[str, float]:
@@ -125,7 +146,7 @@ def extract_financial_data(doc_text: str) -> Dict[str, float]:
     extraction_schema = {
         "type": "OBJECT",
         "properties": {
-            "Vốn_đầu_tư": {"type": "STRING", "description": "Giá trị vốn đầu tư ban đầu (ví dụ: 30 tỷ VND)"},
+            "Vốn_đầu_tư": {"type": "STRING", "description": "Giá trị vốn đầu tư ban đầu, bao gồm cả đơn vị (ví dụ: 30 tỷ VND)"},
             "Vòng_đời_dự_án": {"type": "STRING", "description": "Số năm vòng đời dự án (ví dụ: 10 năm)"},
             "Doanh_thu": {"type": "STRING", "description": "Doanh thu hàng năm (ví dụ: 3.5 tỷ)"},
             "Chi_phí": {"type": "STRING", "description": "Chi phí hoạt động hàng năm (ví dụ: 2 tỷ)"},
@@ -136,7 +157,8 @@ def extract_financial_data(doc_text: str) -> Dict[str, float]:
     
     system_prompt = (
         "Bạn là một chuyên gia phân tích tài chính. Hãy trích xuất các thông số tài chính chính xác "
-        "từ văn bản dự án kinh doanh được cung cấp, bao gồm cả đơn vị (nếu có) vào định dạng JSON. "
+        "từ văn bản dự án kinh doanh được cung cấp, bao gồm cả đơn vị (nếu có). "
+        "Đảm bảo kết quả trả về là một đối tượng JSON tuân thủ schema đã cho. "
         "Giả định dự án có dòng tiền đều hàng năm. Chỉ trả về JSON."
     )
     
@@ -153,9 +175,14 @@ def extract_financial_data(doc_text: str) -> Dict[str, float]:
             'N': int(clean_and_convert_to_float(raw_data.get('Vòng_đời_dự_án', '0'))),
             'R': clean_and_convert_to_float(raw_data.get('Doanh_thu', '0')),
             'C': clean_and_convert_to_float(raw_data.get('Chi_phí', '0')),
-            'WACC': clean_and_convert_to_float(raw_data.get('WACC', '0')) / 100, # Chuyển % sang thập phân
-            'Tax': clean_and_convert_to_float(raw_data.get('Thuế', '0')) / 100
+            'WACC': clean_and_convert_to_float(raw_data.get('WACC', '0')), 
+            'Tax': clean_and_convert_to_float(raw_data.get('Thuế', '0'))
         }
+        
+        # Đảm bảo WACC và Tax ở dạng thập phân (ví dụ: 0.13 và 0.2)
+        if processed_data['WACC'] > 1.0: processed_data['WACC'] /= 100.0
+        if processed_data['Tax'] > 1.0: processed_data['Tax'] /= 100.0
+
         return processed_data
     return {}
 
@@ -166,18 +193,22 @@ def calculate_financial_metrics(data: Dict[str, float]) -> Dict[str, Any]:
     N = int(data.get('N', 0))
     R = data.get('R', 0)
     C = data.get('C', 0)
-    WACC = data.get('WACC', 0.1) # Default WACC 10%
-
-    if N <= 0 or I0 <= 0:
-        return {"NPV": np.nan, "IRR": np.nan, "PP": np.nan, "DPP": np.nan, "CF_Table": []}
-
+    WACC = data.get('WACC', 0.1) 
     Tax = data.get('Tax', 0.2)
     
+    # Kiểm tra dữ liệu đầu vào cơ bản
+    if N <= 0 or I0 <= 0:
+        return {"NPV": np.nan, "IRR": np.nan, "PP": np.nan, "DPP": np.nan, "CF_Table": []}
+    
     # 1. Tính Dòng tiền thuần hàng năm (NCF)
-    # Giả định: Không có khấu hao, NCF = PAT
     PBT = R - C
     PAT = PBT * (1 - Tax)
-    NCF = PAT # Dòng tiền thuần hàng năm
+    NCF = PAT # Dòng tiền thuần hàng năm (Giả định NCF đều hàng năm và không có Khấu hao)
+    data['NCF'] = NCF # Cập nhật NCF vào dict gốc
+
+    # Kiểm tra NCF để tránh chia cho 0
+    if NCF <= 0 and I0 > 0:
+        return {"NPV": -I0, "IRR": np.nan, "PP": np.nan, "DPP": np.nan, "CF_Table": []}
 
     # Bảng Dòng tiền
     cf_data = []
@@ -209,40 +240,36 @@ def calculate_financial_metrics(data: Dict[str, float]) -> Dict[str, Any]:
     NPV = cf_df['PV_NCF'].sum()
     
     # 3. IRR (Tỷ suất sinh lời nội bộ)
-    # Dòng tiền cho numpy.irr (năm 0 là -I0, các năm sau là NCF)
     cash_flows = np.array([-I0] + [NCF] * N)
     try:
         IRR = np.irr(cash_flows)
     except ValueError:
-        IRR = np.nan # Có thể không tìm thấy IRR nếu NCF quá thấp
+        IRR = np.nan
         
-    # 4. PP (Thời gian hoàn vốn)
-    # Hoàn vốn đều
-    PP = I0 / NCF if NCF > 0 else np.nan
-    
-    # 5. DPP (Thời gian hoàn vốn có chiết khấu)
+    # 4. PP (Thời gian hoàn vốn) và 5. DPP (Thời gian hoàn vốn có chiết khấu)
+    PP = np.nan
     DPP = np.nan
     
-    # Tính PP và DPP từ CF_Cum và PV_CF_Cum
-    
-    # Tìm năm hoàn vốn PP
+    # Tính PP từ CF_Cum
     pp_row_idx = cf_df[cf_df['CF_Cum'] >= 0].index
-    if len(pp_row_idx) > 0:
-        k = pp_row_idx[0] # Năm hoàn vốn đầu tiên (ví dụ: năm 4)
-        CF_k_minus_1 = cf_df.loc[k-1, 'CF_Cum'] # Dòng tiền tích lũy cuối năm trước (năm 3)
+    if len(pp_row_idx) > 0 and pp_row_idx[0] > 0:
+        k = pp_row_idx[0] 
+        CF_k_minus_1 = cf_df.loc[k-1, 'CF_Cum']
         
-        # Công thức: k - 1 + |CF tích lũy năm k-1| / NCF năm k
-        PP = (k - 1) + abs(CF_k_minus_1) / NCF
+        # Chỉ tính nếu NCF > 0 để tránh lỗi chia cho 0
+        if NCF > 0:
+             PP = (k - 1) + abs(CF_k_minus_1) / NCF
     
-    # Tìm năm hoàn vốn DPP
+    # Tính DPP từ PV_CF_Cum
     dpp_row_idx = cf_df[cf_df['PV_CF_Cum'] >= 0].index
-    if len(dpp_row_idx) > 0:
-        k_dpp = dpp_row_idx[0] # Năm hoàn vốn chiết khấu đầu tiên
-        PV_CF_k_minus_1 = cf_df.loc[k_dpp-1, 'PV_CF_Cum'] # Dòng tiền chiết khấu tích lũy cuối năm trước
-        PV_NCF_k = cf_df.loc[k_dpp, 'PV_NCF'] # Dòng tiền chiết khấu của năm k
+    if len(dpp_row_idx) > 0 and dpp_row_idx[0] > 0:
+        k_dpp = dpp_row_idx[0] 
+        PV_CF_k_minus_1 = cf_df.loc[k_dpp-1, 'PV_CF_Cum'] 
+        PV_NCF_k = cf_df.loc[k_dpp, 'PV_NCF'] 
         
-        # Công thức: k_dpp - 1 + |PV_CF tích lũy năm k_dpp-1| / PV_NCF năm k
-        DPP = (k_dpp - 1) + abs(PV_CF_k_minus_1) / PV_NCF_k
+        # Chỉ tính nếu PV_NCF_k > 0
+        if PV_NCF_k > 0:
+            DPP = (k_dpp - 1) + abs(PV_CF_k_minus_1) / PV_NCF_k
         
     
     return {
@@ -272,6 +299,14 @@ def get_ai_analysis_report(metrics: Dict[str, Any], initial_data: Dict[str, floa
         f"Vòng đời dự án: {initial_data.get('N')} năm\n"
         f"Dòng tiền thuần (NCF) hàng năm: {format_currency(initial_data.get('NCF'))}\n"
     )
+    
+    # Thêm điều kiện để AI đưa ra quyết định chấp nhận/từ chối rõ ràng hơn
+    if not math.isnan(NPV) and NPV > 0 and not math.isnan(IRR) and IRR > WACC/100:
+        feasibility_status = "Dự án có khả năng chấp nhận (NPV > 0 và IRR > WACC)."
+    elif not math.isnan(NPV) and NPV < 0:
+        feasibility_status = "Dự án có khả năng bị từ chối (NPV < 0)."
+    else:
+        feasibility_status = "Dữ liệu không đủ hoặc dự án biên độ thấp (cần phân tích sâu)."
 
     system_prompt = (
         "Bạn là một chuyên gia thẩm định và phân tích dự án đầu tư. "
@@ -282,7 +317,10 @@ def get_ai_analysis_report(metrics: Dict[str, Any], initial_data: Dict[str, floa
         "Viết bằng tiếng Việt và sử dụng ngôn ngữ chuyên nghiệp."
     )
     
-    prompt = f"Phân tích báo cáo hiệu quả tài chính dự án với các chỉ số sau:\n\n---\n{data_for_ai}\n---"
+    prompt = (
+        f"Phân tích báo cáo hiệu quả tài chính dự án với các chỉ số sau:\n\n---\n{data_for_ai}\n---"
+        f"Hãy bắt đầu báo cáo bằng việc khẳng định trạng thái dự án: {feasibility_status}"
+    )
     
     with st.spinner("4. AI đang tạo báo cáo phân tích chuyên sâu..."):
         analysis_report = call_gemini_api(prompt, system_prompt, is_json=False)
@@ -298,18 +336,19 @@ st.set_page_config(
 st.title("💰 Phân Tích Hiệu Quả Dự Án Đầu Tư Tự Động")
 st.markdown("Sử dụng AI để trích xuất dữ liệu từ file Word và tính toán các chỉ số NPV, IRR, PP, DPP.")
 
-# --- 1. Tải File và Lọc Dữ liệu ---
-uploaded_file = st.file_uploader(
-    "Tải lên file Word (.docx) chứa phương án kinh doanh",
-    type=['docx']
-)
-
+# --- Session State Initialization ---
 if 'project_data' not in st.session_state:
     st.session_state.project_data = {}
 if 'metrics' not in st.session_state:
     st.session_state.metrics = {}
 if 'doc_text' not in st.session_state:
     st.session_state.doc_text = ""
+
+# --- 1. Tải File và Lọc Dữ liệu ---
+uploaded_file = st.file_uploader(
+    "Tải lên file Word (.docx) chứa phương án kinh doanh",
+    type=['docx']
+)
 
 if uploaded_file is not None:
     st.session_state.doc_text = read_docx(uploaded_file)
@@ -327,6 +366,12 @@ if uploaded_file is not None:
         col1, col2, col3 = st.columns(3)
         col4, col5, col6 = st.columns(3)
 
+        # Tính toán NCF để hiển thị
+        PBT = data.get('R', 0) - data.get('C', 0)
+        PAT = PBT * (1 - data.get('Tax', 0.2))
+        NCF = PAT
+        st.session_state.project_data['NCF'] = NCF # Lưu NCF vào state
+
         col1.metric("Vốn Đầu tư ($I_0$)", format_currency(data.get('I0')))
         col2.metric("Vòng đời Dự án ($N$)", f"{data.get('N')} năm")
         col3.metric("WACC", f"{data.get('WACC', 0.0) * 100:.2f}%")
@@ -334,12 +379,6 @@ if uploaded_file is not None:
         col5.metric("Chi phí ($C$)", format_currency(data.get('C')))
         col6.metric("Thuế suất", f"{data.get('Tax', 0.0) * 100:.0f}%")
         
-        # Tính toán NCF để hiển thị
-        PBT = data.get('R', 0) - data.get('C', 0)
-        PAT = PBT * (1 - data.get('Tax', 0.2))
-        NCF = PAT
-        st.session_state.project_data['NCF'] = NCF # Lưu NCF vào state
-
         st.metric("Dòng tiền thuần (NCF) hàng năm", format_currency(NCF))
         st.markdown("---")
         
@@ -348,8 +387,9 @@ if uploaded_file is not None:
         
         if st.button("Tính toán Chỉ số Tài chính (NPV, IRR, PP, DPP)"):
             st.session_state.metrics = calculate_financial_metrics(st.session_state.project_data)
-
-        if st.session_state.metrics and st.session_state.metrics.get("CF_Table") is not None:
+            
+        # Kiểm tra nếu tính toán đã được thực hiện và thành công
+        if st.session_state.metrics and st.session_state.metrics.get("CF_Table") is not None and not st.session_state.metrics.get("CF_Table").empty:
             metrics = st.session_state.metrics
             
             # Hiển thị Chỉ số Đánh giá
@@ -367,10 +407,10 @@ if uploaded_file is not None:
             cf_df['Năm'] = cf_df['Năm'].astype(int)
             st.dataframe(
                 cf_df.style.format({
-                    'NCF': lambda x: format_currency(x) if x != 0 else "-",
-                    'PV_NCF': lambda x: format_currency(x) if x != 0 else "-",
-                    'CF_Cum': lambda x: format_currency(x) if x != 0 else "-",
-                    'PV_CF_Cum': lambda x: format_currency(x) if x != 0 else "-",
+                    'NCF': lambda x: format_currency(x),
+                    'PV_NCF': lambda x: format_currency(x),
+                    'CF_Cum': lambda x: format_currency(x),
+                    'PV_CF_Cum': lambda x: format_currency(x),
                 }),
                 use_container_width=True,
                 hide_index=True
@@ -391,8 +431,8 @@ if uploaded_file is not None:
     else:
         if uploaded_file and st.session_state.doc_text and not st.session_state.project_data:
              st.warning("Vui lòng nhấn nút 'Lọc Dữ liệu Tài chính (AI)' để trích xuất thông số.")
-        elif uploaded_file and st.session_state.project_data:
-             st.warning("Không thể tính toán: Dữ liệu chưa đủ hoặc Vốn Đầu tư/Vòng đời dự án bằng 0.")
+        elif uploaded_file and st.session_state.project_data and st.session_state.project_data.get('I0', 0) <= 0:
+             st.error("Không thể tính toán: Vốn Đầu tư ($I_0$) hoặc Vòng đời Dự án ($N$) được trích xuất bằng 0 hoặc không phải số dương.")
 
 else:
     st.info("Vui lòng tải lên file Word để bắt đầu phân tích.")
